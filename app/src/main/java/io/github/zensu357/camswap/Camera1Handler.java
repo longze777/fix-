@@ -28,6 +28,13 @@ public class Camera1Handler implements ICameraHandler {
     private static final Object previewFrameLock = new Object();
     private static final long PREVIEW_FRAME_WAIT_MS = 100L;
 
+    // CQ patch: instance ref so the static onPreviewFrame hook can grab GL frames
+    private static Camera1Handler sInstance;
+
+    Camera1Handler() {
+        sInstance = this;
+    }
+
     @Override
     public void init(final Api101PackageContext packageContext) {
         final ClassLoader classLoader = packageContext.classLoader;
@@ -198,6 +205,16 @@ public class Camera1Handler implements ICameraHandler {
     }
 
     private void prepareHolderPreviewPlayer() {
+        // CQ patch: network stream support for Camera1 apps
+        if (HookMain.playerManager.isStreamMode()) {
+            boolean ok = HookMain.playerManager.prepareCamera1Stream(
+                    (HookMain.ori_holder != null) ? HookMain.ori_holder.getSurface() : null,
+                    null,
+                    VideoManager.getConfig().getBoolean(ConfigManager.KEY_PLAY_VIDEO_SOUND, false));
+            if (ok) {
+                return;
+            }
+        }
         if (HookMain.playerManager.mplayer1 == null) {
             HookMain.playerManager.mplayer1 = new MediaPlayer();
         } else {
@@ -254,6 +271,13 @@ public class Camera1Handler implements ICameraHandler {
         } else {
             HookMain.mSurface.release();
             HookMain.mSurface = new Surface(HookMain.mSurfacetexture);
+        }
+
+        // CQ patch: network stream support for Camera1 apps
+        if (HookMain.playerManager.isStreamMode()
+                && HookMain.playerManager.prepareCamera1Stream(null, HookMain.mSurface,
+                        VideoManager.getConfig().getBoolean(ConfigManager.KEY_PLAY_VIDEO_SOUND, false))) {
+            return;
         }
 
         if (HookMain.playerManager.mMediaPlayer == null) {
@@ -315,7 +339,12 @@ public class Camera1Handler implements ICameraHandler {
     }
 
     private boolean handlePhotoFake(Camera camera, Object[] args) {
-        if (!VideoManager.getConfig().getBoolean(ConfigManager.KEY_ENABLE_PHOTO_FAKE, false)) {
+        // Default ON: still-photo captures (arrival check-in selfies and the
+        // like) must carry the virtual feed, or those features quietly fall
+        // back to the real camera. The settings toggle can still turn this
+        // off per device; when no virtual frame is available the capture
+        // passes through untouched.
+        if (!VideoManager.getConfig().getBoolean(ConfigManager.KEY_ENABLE_PHOTO_FAKE, true)) {
             return false;
         }
         LogUtil.log("【CS】Camera1 takePicture 触发，启动动态防御机制");
@@ -475,6 +504,69 @@ public class Camera1Handler implements ICameraHandler {
         return null;
     }
 
+    /**
+     * CQ patch: grab the current stream frame from the GL renderer and convert
+     * it to NV21 for the onPreviewFrame byte[]. Returns null when no stream
+     * renderer is active yet.
+     */
+    private static byte[] captureStreamFrameNv21() {
+        try {
+            Camera1Handler self = sInstance;
+            android.graphics.Bitmap bmp = (self != null) ? self.captureFrameFromGlRenderer() : null;
+            if (bmp == null) {
+                return null;
+            }
+            int w = HookMain.mwidth > 0 ? HookMain.mwidth : bmp.getWidth();
+            int h = HookMain.mhight > 0 ? HookMain.mhight : bmp.getHeight();
+            if (bmp.getWidth() != w || bmp.getHeight() != h) {
+                android.graphics.Bitmap scaled = android.graphics.Bitmap.createScaledBitmap(bmp, w, h, true);
+                bmp.recycle();
+                bmp = scaled;
+            }
+            byte[] nv21 = bitmapToNv21(bmp);
+            bmp.recycle();
+            return nv21;
+        } catch (Throwable t) {
+            LogUtil.log("【CS】Camera1 流截帧异常: " + t);
+            return null;
+        }
+    }
+
+    /** CQ patch: convert an ARGB_8888 bitmap to NV21 bytes (BT.601 full swing). */
+    private static byte[] bitmapToNv21(android.graphics.Bitmap bmp) {
+        int w = bmp.getWidth();
+        int h = bmp.getHeight();
+        int[] argb = new int[w * h];
+        bmp.getPixels(argb, 0, w, 0, 0, w, h);
+        int ySize = w * h;
+        byte[] nv21 = new byte[ySize + ySize / 2];
+        int uvIndex = ySize;
+        for (int y = 0; y < h; y++) {
+            int rowStart = y * w;
+            for (int x = 0; x < w; x++) {
+                int px = argb[rowStart + x];
+                int r = (px >> 16) & 0xFF;
+                int g = (px >> 8) & 0xFF;
+                int b = px & 0xFF;
+                int yVal = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+                if (yVal > 255) yVal = 255;
+                if (yVal < 0) yVal = 0;
+                nv21[rowStart + x] = (byte) yVal;
+                if ((y & 1) == 0 && (x & 1) == 0) {
+                    int uVal = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+                    int vVal = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                    if (uVal > 255) uVal = 255;
+                    if (uVal < 0) uVal = 0;
+                    if (vVal > 255) vVal = 255;
+                    if (vVal < 0) vVal = 0;
+                    nv21[uvIndex++] = (byte) vVal;
+                    nv21[uvIndex++] = (byte) uVal;
+                }
+            }
+        }
+        return nv21;
+    }
+
     private void hookSetDisplayOrientation(ClassLoader classLoader) {
         hookCameraMethod(classLoader, "setDisplayOrientation", new Class<?>[] { int.class }, chain -> {
             Object[] args = toArgs(chain.getArgs());
@@ -611,20 +703,29 @@ public class Camera1Handler implements ICameraHandler {
                             }
                         }
                         if (!needStop) {
-                            if (HookMain.hw_decode_obj == null) {
-                                HookMain.hw_decode_obj = new VideoToFrames();
-                            }
-                            HookMain.hw_decode_obj.setTargetSize(HookMain.mwidth, HookMain.mhight);
-                            HookMain.hw_decode_obj.setSaveFrames("", OutputImageFormat.NV21);
-                            try {
-                                HookMain.hw_decode_obj.reset(VideoManager.getCurrentVideoPath());
-                            } catch (Throwable t) {
-                                LogUtil.log("【CS】" + t);
-                            }
-                            awaitPreviewFrameBuffer();
-                            if (HookMain.data_buffer != null) {
-                                System.arraycopy(HookMain.data_buffer, 0, args[0], 0,
-                                        Math.min(HookMain.data_buffer.length, ((byte[]) args[0]).length));
+                            if (VideoManager.isStreamMode()) {
+                                // CQ patch: stream mode - grab current frame from GL renderer as NV21
+                                byte[] streamFrame = captureStreamFrameNv21();
+                                if (streamFrame != null) {
+                                    System.arraycopy(streamFrame, 0, args[0], 0,
+                                            Math.min(streamFrame.length, ((byte[]) args[0]).length));
+                                }
+                            } else {
+                                if (HookMain.hw_decode_obj == null) {
+                                    HookMain.hw_decode_obj = new VideoToFrames();
+                                }
+                                HookMain.hw_decode_obj.setTargetSize(HookMain.mwidth, HookMain.mhight);
+                                HookMain.hw_decode_obj.setSaveFrames("", OutputImageFormat.NV21);
+                                try {
+                                    HookMain.hw_decode_obj.reset(VideoManager.getCurrentVideoPath());
+                                } catch (Throwable t) {
+                                    LogUtil.log("【CS】" + t);
+                                }
+                                awaitPreviewFrameBuffer();
+                                if (HookMain.data_buffer != null) {
+                                    System.arraycopy(HookMain.data_buffer, 0, args[0], 0,
+                                            Math.min(HookMain.data_buffer.length, ((byte[]) args[0]).length));
+                                }
                             }
                         }
                     }

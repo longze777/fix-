@@ -1,17 +1,27 @@
 #include "hook_opensles.h"
+#include "got_hook.h"
 #include "pcm_bridge.h"
 #include <android/log.h>
 #include <dlfcn.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <cstring>
+#include <cstdint>
 #include <unordered_map>
 #include <mutex>
 #include <SLES/OpenSLES.h>
 #include <SLES/OpenSLES_Android.h>
-#include "dobby.h"
 
 #define LOG_TAG "CS-OpenSLHook"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// Hooking strategy (2026-10-19): the OpenSL ES hooks used to be Dobby inline
+// hooks on the implementation functions the interface vtables point at, which
+// rewrote libOpenSLES.so code in memory - the byte-compare signature. Now the
+// vtable *entries themselves* are swapped (data, not code), and the
+// slCreateEngine fallback is a GOT hook. Same coverage, zero bytes changed in
+// any system library's executable segment.
 
 // ============================================================
 // Tracking structures
@@ -185,7 +195,43 @@ static SLresult hooked_Enqueue(
 }
 
 // ============================================================
-// Hook vtable entries using Dobby inline hook
+// Data-only vtable rewrite
+// ============================================================
+//
+// The per-class function tables behind the OpenSL ES interfaces are static
+// structs shared by every instance, so swapping one entry hooks the whole
+// class. The store goes through got_hook's /proc/self/mem channel - page
+// protections bypassed, and a failure is an error, not a signal - with the
+// mprotect+direct-store route as fallback for kernels where the mem write
+// is refused.
+static bool swap_vtable_entry(void** entry_slot, void* hook_fn, void** orig_out,
+                              const char* label) {
+    if (!entry_slot) return false;
+    void* cur = *entry_slot;
+    if (!cur) return false;
+    if (cur == hook_fn) return true;  // ours already
+
+    bool ok = got_hook::write_ptr((void*)entry_slot, hook_fn);
+    if (!ok) {
+        long page = sysconf(_SC_PAGESIZE);
+        uintptr_t base = reinterpret_cast<uintptr_t>(entry_slot) & ~(uintptr_t)(page - 1);
+        if (mprotect(reinterpret_cast<void*>(base), page, PROT_READ | PROT_WRITE) == 0) {
+            *entry_slot = hook_fn;
+            mprotect(reinterpret_cast<void*>(base), page, PROT_READ);
+            ok = true;
+        }
+    }
+    if (!ok) {
+        LOGE("vtable-swap %s: write failed", label);
+        return false;
+    }
+    if (orig_out && *orig_out == nullptr) *orig_out = cur;
+    LOGI("vtable-swap %s ok (orig=%p)", label, cur);
+    return true;
+}
+
+// ============================================================
+// Hook vtable entries by pointer swap
 // ============================================================
 
 static bool try_hook_vtable(SLAndroidSimpleBufferQueueItf bq) {
@@ -213,29 +259,15 @@ static bool try_hook_vtable(SLAndroidSimpleBufferQueueItf bq) {
     //   [2] = Enqueue
     //   [3] = GetState
 
-    void* registerCb_addr = vtable[0];
-    void* enqueue_addr = vtable[2];
-
-    if (registerCb_addr) {
-        if (DobbyHook(registerCb_addr, reinterpret_cast<dobby_dummy_func_t>(hooked_RegisterCallback),
-                       reinterpret_cast<dobby_dummy_func_t*>(&orig_RegisterCallback)) == 0) {
-            LOGI("Hooked SLAndroidSimpleBufferQueueItf::RegisterCallback");
-        } else {
-            LOGE("Failed to hook RegisterCallback");
-        }
-    }
-
-    if (enqueue_addr) {
-        if (DobbyHook(enqueue_addr, reinterpret_cast<dobby_dummy_func_t>(hooked_Enqueue),
-                       reinterpret_cast<dobby_dummy_func_t*>(&orig_Enqueue)) == 0) {
-            LOGI("Hooked SLAndroidSimpleBufferQueueItf::Enqueue");
-        } else {
-            LOGE("Failed to hook Enqueue");
-        }
-    }
+    bool r1 = swap_vtable_entry(&vtable[0], (void*)&hooked_RegisterCallback,
+                                (void**)&orig_RegisterCallback, "BufferQueue::RegisterCallback");
+    if (!r1) LOGE("Failed to hook RegisterCallback");
+    bool r2 = swap_vtable_entry(&vtable[2], (void*)&hooked_Enqueue,
+                                (void**)&orig_Enqueue, "BufferQueue::Enqueue");
+    if (!r2) LOGE("Failed to hook Enqueue");
 
     g_vtable_hooked = true;
-    return true;
+    return r1 && r2;
 }
 
 // ============================================================
@@ -286,23 +318,44 @@ static SLresult hooked_GetInterface(
 
     SLresult result = orig_GetInterface(self, iid, pInterface);
 
-    if (result == SL_RESULT_SUCCESS && pInterface) {
-        std::lock_guard<std::mutex> lock(g_sl_mutex);
-        auto it = g_recorder_objects.find(self);
-        if (it != g_recorder_objects.end()) {
-            // 这是一个录音器对象的 GetInterface 调用
-            SLAndroidSimpleBufferQueueItf bq =
-                *static_cast<SLAndroidSimpleBufferQueueItf*>(pInterface);
-            if (bq) {
-                g_is_recorder_bq[bq] = true;
-                // 将音频参数传递给 recorder map
-                auto& info = g_recorder_map[bq];
-                info.sampleRate = it->second.sampleRate;
-                info.channels = it->second.channels;
-                LOGI("GetInterface: marked bq as recorder, sampleRate=%u channels=%u",
-                     info.sampleRate, info.channels);
+    // Only the simple-buffer-queue interface of a known recorder is marked.
+    // The original cast the out-pointer unconditionally, so any OTHER
+    // interface fetched on a recorder (volume, record, ...) was recorded as a
+    // buffer queue and its calls would have been wrapped as one.
+    SLAndroidSimpleBufferQueueItf fresh_bq = nullptr;
+    if (result == SL_RESULT_SUCCESS && pInterface && iid) {
+        bool is_bq_iid =
+            iid == SL_IID_ANDROIDSIMPLEBUFFERQUEUE ||
+            memcmp(iid, SL_IID_ANDROIDSIMPLEBUFFERQUEUE, sizeof(struct SLInterfaceID_)) == 0;
+        if (is_bq_iid) {
+            std::lock_guard<std::mutex> lock(g_sl_mutex);
+            auto it = g_recorder_objects.find(self);
+            if (it != g_recorder_objects.end()) {
+                // 这是一个录音器对象的 GetInterface 调用
+                SLAndroidSimpleBufferQueueItf bq =
+                    *static_cast<SLAndroidSimpleBufferQueueItf*>(pInterface);
+                if (bq) {
+                    g_is_recorder_bq[bq] = true;
+                    // 将音频参数传递给 recorder map
+                    auto& info = g_recorder_map[bq];
+                    info.sampleRate = it->second.sampleRate;
+                    info.channels = it->second.channels;
+                    fresh_bq = bq;
+                    LOGI("GetInterface: marked bq as recorder, sampleRate=%u channels=%u",
+                         info.sampleRate, info.channels);
+                }
             }
         }
+    }
+
+    // The temp-recorder resolution at install time can fail (Realize refused
+    // inside this process), leaving the shared BufferQueue table unswapped.
+    // Holding the app's own live queue here is the other moment to swap it:
+    // every queue the app makes afterwards - this one included - routes
+    // RegisterCallback/Enqueue through the wrappers.
+    if (fresh_bq && !g_vtable_hooked) {
+        LOGI("GetInterface: swapping BufferQueue table from the app's own queue");
+        try_hook_vtable(fresh_bq);
     }
 
     return result;
@@ -324,12 +377,12 @@ static void hooked_Destroy(SLObjectItf self) {
 // Hook engine vtable to intercept CreateAudioRecorder
 // ============================================================
 
-static void try_hook_engine_vtable(SLEngineItf engine) {
-    if (g_engine_vtable_hooked || !engine) return;
+static bool try_hook_engine_vtable(SLEngineItf engine) {
+    if (g_engine_vtable_hooked || !engine) return false;
 
     // SLEngineItf is SLEngineItf_** -> vtable
     void** vtable = const_cast<void**>(reinterpret_cast<const void* const*>(*engine));
-    if (!vtable) return;
+    if (!vtable) return false;
 
     // SLEngineItf_ vtable layout:
     //   [0] = CreateLEDDevice
@@ -337,26 +390,17 @@ static void try_hook_engine_vtable(SLEngineItf engine) {
     //   [2] = CreateAudioPlayer
     //   [3] = CreateAudioRecorder
     //   ... etc
-    void* createRecorder_addr = vtable[3];
-
-    if (createRecorder_addr) {
-        if (DobbyHook(createRecorder_addr,
-                       reinterpret_cast<dobby_dummy_func_t>(hooked_CreateAudioRecorder),
-                       reinterpret_cast<dobby_dummy_func_t*>(&orig_CreateAudioRecorder)) == 0) {
-            LOGI("Hooked SLEngineItf::CreateAudioRecorder");
-        } else {
-            LOGE("Failed to hook CreateAudioRecorder");
-        }
-    }
-
+    bool ok = swap_vtable_entry(&vtable[3], (void*)&hooked_CreateAudioRecorder,
+                                (void**)&orig_CreateAudioRecorder, "Engine::CreateAudioRecorder");
     g_engine_vtable_hooked = true;
+    return ok;
 }
 
-static void try_hook_object_vtable(SLObjectItf obj) {
-    if (g_object_vtable_hooked || !obj) return;
+static bool try_hook_object_vtable(SLObjectItf obj) {
+    if (g_object_vtable_hooked || !obj) return false;
 
     void** vtable = const_cast<void**>(reinterpret_cast<const void* const*>(*obj));
-    if (!vtable) return;
+    if (!vtable) return false;
 
     // SLObjectItf_ vtable layout:
     //   [0] = Realize
@@ -370,30 +414,12 @@ static void try_hook_object_vtable(SLObjectItf obj) {
     //   [8] = GetPriority
     //   [9] = SetLossOfControlInterfaces
 
-    void* getInterface_addr = vtable[3];
-    void* destroy_addr = vtable[6];
-
-    if (getInterface_addr) {
-        if (DobbyHook(getInterface_addr,
-                       reinterpret_cast<dobby_dummy_func_t>(hooked_GetInterface),
-                       reinterpret_cast<dobby_dummy_func_t*>(&orig_GetInterface)) == 0) {
-            LOGI("Hooked SLObjectItf::GetInterface");
-        } else {
-            LOGE("Failed to hook GetInterface");
-        }
-    }
-
-    if (destroy_addr) {
-        if (DobbyHook(destroy_addr,
-                       reinterpret_cast<dobby_dummy_func_t>(hooked_Destroy),
-                       reinterpret_cast<dobby_dummy_func_t*>(&orig_Destroy)) == 0) {
-            LOGI("Hooked SLObjectItf::Destroy");
-        } else {
-            LOGE("Failed to hook Destroy");
-        }
-    }
-
+    bool ok = swap_vtable_entry(&vtable[3], (void*)&hooked_GetInterface,
+                                (void**)&orig_GetInterface, "Object::GetInterface");
+    ok &= swap_vtable_entry(&vtable[6], (void*)&hooked_Destroy,
+                            (void**)&orig_Destroy, "Object::Destroy");
     g_object_vtable_hooked = true;
+    return ok;
 }
 
 // ============================================================
@@ -522,25 +548,31 @@ static SLresult hooked_slCreateEngine(
 void install_opensles_hooks() {
     void* handle = dlopen("libOpenSLES.so", RTLD_NOW);
     if (!handle) {
-        LOGI("libOpenSLES.so not available — skipping OpenSL ES hooks");
+        LOGI("libOpenSLES.so not available - skipping OpenSL ES hooks");
         return;
     }
 
-    // Try to resolve vtable immediately
+    // Try to resolve vtable immediately (creates a temp engine + recorder and
+    // swaps their shared class-wide function tables)
     resolve_vtable_via_temp_recorder();
 
+    // Fallback: GOT-hook slCreateEngine so a deferred resolution runs on the
+    // app's own engine creation, however the caller reaches the function.
     if (!g_vtable_hooked) {
-        // Fallback: hook slCreateEngine to do deferred resolution
-        void* sym = dlsym(handle, "slCreateEngine");
-        if (sym) {
-            if (DobbyHook(sym, reinterpret_cast<dobby_dummy_func_t>(hooked_slCreateEngine),
-                           reinterpret_cast<dobby_dummy_func_t*>(&orig_slCreateEngine)) == 0) {
-                LOGI("Hooked slCreateEngine for deferred vtable resolution");
-            } else {
-                LOGE("Failed to hook slCreateEngine");
-            }
+        int hits = got_hook::hook_all("slCreateEngine", (void*)&hooked_slCreateEngine,
+                                      (void**)&orig_slCreateEngine);
+        if (hits > 0) {
+            LOGI("got-hook slCreateEngine patched=%d orig=%p", hits, (void*)orig_slCreateEngine);
+        } else {
+            // Not fatal: the engine/object vtables are already swapped, and
+            // the BufferQueue table arms from the app's own queue inside
+            // hooked_GetInterface, so recorder coverage does not depend on
+            // catching slCreateEngine itself.
+            LOGI("got-hook slCreateEngine patched=0 (BufferQueue arms on first app queue)");
         }
     }
 
-    LOGI("OpenSL ES hooks installation complete (vtable_hooked=%d)", g_vtable_hooked);
+    LOGI("OpenSL ES hooks installation complete (vtable_hooked=%d, data-only, "
+         "libOpenSLES text untouched)",
+         g_vtable_hooked);
 }

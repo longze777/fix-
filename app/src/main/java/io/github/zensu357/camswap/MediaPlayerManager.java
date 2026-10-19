@@ -412,6 +412,7 @@ public final class MediaPlayerManager {
 
     /** Release Camera1 players and renderers (called from stopPreview/release). */
     void releaseCamera1Resources() {
+        releaseStreamBackend();
         GLVideoRenderer.releaseSafely(c1_renderer_holder);
         c1_renderer_holder = null;
         GLVideoRenderer.releaseSafely(c1_renderer_texture);
@@ -420,6 +421,80 @@ public final class MediaPlayerManager {
         mplayer1 = null;
         stopAndRelease(mMediaPlayer);
         mMediaPlayer = null;
+    }
+
+    // =====================================================================
+    // Camera1 stream playback (CQ patch: network stream for Camera1 apps)
+    // =====================================================================
+
+    /**
+     * Start the shared stream backend for a Camera1 app, rendering into the
+     * given preview surface (holder or texture). Returns false when stream
+     * mode is off or the source/surface is unusable, letting callers fall
+     * back to the local MediaPlayer paths.
+     */
+    boolean prepareCamera1Stream(Surface holderSurface, Surface textureSurface, boolean playSound) {
+        MediaSourceDescriptor source = getMediaSource();
+        if (source == null || !source.isStream() || !source.isValid()) {
+            return false;
+        }
+        Surface target = (holderSurface != null && holderSurface.isValid())
+                ? holderSurface
+                : ((textureSurface != null && textureSurface.isValid()) ? textureSurface : null);
+        if (target == null) {
+            LogUtil.log("【CS】Camera1 流模式：无可用 Surface");
+            return false;
+        }
+        releaseStreamBackend();
+        GLVideoRenderer.releaseSafely(c1_renderer_holder);
+        c1_renderer_holder = null;
+        GLVideoRenderer.releaseSafely(c1_renderer_texture);
+        c1_renderer_texture = null;
+        GLVideoRenderer renderer = GLVideoRenderer.createSafely(target, "c1_stream");
+        c1_renderer_holder = renderer;
+        try {
+            streamBackend = createStreamBackend();
+            Surface backendSurface = (renderer != null && renderer.isInitialized())
+                    ? renderer.getInputSurface()
+                    : target;
+            streamBackend.setOutputSurface(backendSurface);
+            streamBackend.setVolume(playSound ? 1.0f : 0f);
+            streamBackend.setLooping(false); // streams don't loop
+            streamBackend.setListener(new SurfacePlayerBackend.Listener() {
+                @Override
+                public void onReady() {
+                    LogUtil.log("【CS】Camera1 流播放器就绪");
+                }
+
+                @Override
+                public void onError(String message, Throwable cause) {
+                    LogUtil.log("【CS】Camera1 流播放器错误: " + message
+                            + (cause != null ? " " + cause : ""));
+                }
+
+                @Override
+                public void onDisconnected() {
+                    LogUtil.log("【CS】Camera1 流断开连接");
+                }
+
+                @Override
+                public void onReconnected() {
+                    LogUtil.log("【CS】Camera1 流重连成功");
+                }
+
+                @Override
+                public void onCompletion() {
+                    LogUtil.log("【CS】Camera1 流播放完成");
+                }
+            });
+            streamBackend.open(source);
+            LogUtil.log("【CS】Camera1 流模式启动: " + source.streamUrl);
+            return true;
+        } catch (Exception e) {
+            LogUtil.log("【CS】Camera1 流模式初始化失败: " + android.util.Log.getStackTraceString(e));
+            releaseStreamBackend();
+            return false;
+        }
     }
 
     /** Release Camera2 players and renderers (called from onOpened). */

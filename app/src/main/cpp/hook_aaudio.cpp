@@ -1,15 +1,36 @@
 #include "hook_aaudio.h"
+#include "got_hook.h"
 #include "pcm_bridge.h"
 #include <android/log.h>
 #include <dlfcn.h>
 #include <cstring>
+#include <cstdint>
 #include <unordered_map>
 #include <mutex>
-#include "dobby.h"
 
 #define LOG_TAG "CS-AAudioHook"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// ============================================================
+// Hooking strategy (2026-10-19)
+//
+// These hooks used to be Dobby inline hooks, which rewrite the first
+// instructions of each libaaudio.so export. That left the in-memory bytes of
+// the library different from the on-disk image - the exact signature a
+// memory-integrity (byte-compare) check scans for - and on MTK MIUI 14 it
+// also crashed WebView: the exports are 4-byte `B <impl>` tail-call stubs
+// there, and a 16-byte trampoline on a stub clobbers the neighbouring
+// setPerformanceMode/setDeviceId stubs (wangyue arrival crash).
+//
+// Both problems go away by hooking the *callers'* GOT entries instead: the
+// system library's code stays byte-for-byte pristine, and a GOT entry is
+// ordinary relocated data. got_hook also interposes dlopen/dlsym so caller
+// modules loaded later are covered. The original function address comes
+// straight out of the first GOT entry we retarget, so the 4-byte stubs need
+// no special handling - calling through that address executes the stub, like
+// every un-hooked caller does.
+// ============================================================
 
 // ============================================================
 // AAudio type definitions (from aaudio/AAudio.h)
@@ -313,7 +334,7 @@ static aaudio_result_t hooked_AAudioStream_close(AAudioStream* stream) {
 void install_aaudio_hooks() {
     void* handle = dlopen("libaaudio.so", RTLD_NOW);
     if (!handle) {
-        LOGI("libaaudio.so not available — skipping AAudio hooks");
+        LOGI("libaaudio.so not available - skipping AAudio hooks");
         return;
     }
 
@@ -327,49 +348,33 @@ void install_aaudio_hooks() {
     fn_getFormat = reinterpret_cast<fn_AAudioStream_getFormat>(
         dlsym(handle, "AAudioStream_getFormat"));
 
-    // Hook AAudioStream_read
-    void* sym_read = dlsym(handle, "AAudioStream_read");
-    if (sym_read) {
-        if (DobbyHook(sym_read, reinterpret_cast<dobby_dummy_func_t>(hooked_AAudioStream_read),
-                       reinterpret_cast<dobby_dummy_func_t*>(&orig_AAudioStream_read)) == 0) {
-            LOGI("Hooked AAudioStream_read");
+    struct HookDef {
+        const char* symbol;
+        void* replacement;
+        void** orig;
+    };
+    const HookDef defs[] = {
+        {"AAudioStream_read", (void*)&hooked_AAudioStream_read, (void**)&orig_AAudioStream_read},
+        {"AAudioStreamBuilder_setDataCallback", (void*)&hooked_setDataCallback,
+         (void**)&orig_setDataCallback},
+        {"AAudioStreamBuilder_openStream", (void*)&hooked_openStream,
+         (void**)&orig_openStream},
+        {"AAudioStream_close", (void*)&hooked_AAudioStream_close,
+         (void**)&orig_AAudioStream_close},
+    };
+
+    for (const auto& def : defs) {
+        int hits = got_hook::hook_all(def.symbol, def.replacement, def.orig);
+        if (hits > 0) {
+            void* orig = def.orig ? *def.orig : nullptr;
+            LOGI("got-hook %s patched=%d orig=%p", def.symbol, hits, orig);
         } else {
-            LOGE("Failed to hook AAudioStream_read");
+            // No importer loaded yet at init time - engines load their audio
+            // libraries after Application.onCreate. The rescan worker in
+            // native_audio_hook picks these up as the callers bind their GOTs.
+            LOGI("got-hook %s patched=0 (no importer yet; rescan pending)", def.symbol);
         }
     }
 
-    // Hook AAudioStreamBuilder_setDataCallback
-    void* sym_setCb = dlsym(handle, "AAudioStreamBuilder_setDataCallback");
-    if (sym_setCb) {
-        if (DobbyHook(sym_setCb, reinterpret_cast<dobby_dummy_func_t>(hooked_setDataCallback),
-                       reinterpret_cast<dobby_dummy_func_t*>(&orig_setDataCallback)) == 0) {
-            LOGI("Hooked AAudioStreamBuilder_setDataCallback");
-        } else {
-            LOGE("Failed to hook AAudioStreamBuilder_setDataCallback");
-        }
-    }
-
-    // Hook AAudioStreamBuilder_openStream
-    void* sym_open = dlsym(handle, "AAudioStreamBuilder_openStream");
-    if (sym_open) {
-        if (DobbyHook(sym_open, reinterpret_cast<dobby_dummy_func_t>(hooked_openStream),
-                       reinterpret_cast<dobby_dummy_func_t*>(&orig_openStream)) == 0) {
-            LOGI("Hooked AAudioStreamBuilder_openStream");
-        } else {
-            LOGE("Failed to hook AAudioStreamBuilder_openStream");
-        }
-    }
-
-    // Hook AAudioStream_close — 清理 stream map 防止内存泄漏
-    void* sym_close = dlsym(handle, "AAudioStream_close");
-    if (sym_close) {
-        if (DobbyHook(sym_close, reinterpret_cast<dobby_dummy_func_t>(hooked_AAudioStream_close),
-                       reinterpret_cast<dobby_dummy_func_t*>(&orig_AAudioStream_close)) == 0) {
-            LOGI("Hooked AAudioStream_close");
-        } else {
-            LOGE("Failed to hook AAudioStream_close");
-        }
-    }
-
-    LOGI("AAudio hooks installation complete");
+    LOGI("AAudio hooks installation complete (GOT mode, libaaudio text untouched)");
 }

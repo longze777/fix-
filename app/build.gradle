@@ -36,7 +36,10 @@ android {
         minSdk 26
         targetSdk 36
         versionCode versionCodeInt
-        versionName "2.8.${versionSuffix}"
+        // Release line tag: the arrival-checkin fix (virtual camera stays in
+        // place on the DTF liveness screen, ScreenColorDetector injects the
+        // three-color flash into the rendered feed).
+        versionName "tuzi999"
 
         // Inject build time into BuildConfig
         buildConfigField "String", "BUILD_TIME", "\"${buildTime}\""

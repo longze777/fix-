@@ -142,8 +142,11 @@ public class Camera2Handler implements ICameraHandler {
                         return chain.proceed(args);
                     }
 
-                    // Dynamic defense for Photo Fake
-                    if (VideoManager.getConfig().getBoolean(ConfigManager.KEY_ENABLE_PHOTO_FAKE, false)
+                    // Dynamic defense for Photo Fake (default ON, see
+                    // Camera1Handler.handlePhotoFake): JPEG stills must carry
+                    // the virtual feed too, or photo-type features quietly
+                    // fall back to the real camera.
+                    if (VideoManager.getConfig().getBoolean(ConfigManager.KEY_ENABLE_PHOTO_FAKE, true)
                             && HookMain.camera2Hook.isTrackedReaderSurface(targetSurface)) {
                         LogUtil.log("【CS】【addTarget】检测到 ImageReader Surface: " + targetSurface);
                         if (HookMain.camera2Hook.isJpegReaderSurface(targetSurface)) {
@@ -239,7 +242,7 @@ public class Camera2Handler implements ICameraHandler {
                             } else {
                                 LogUtil.log("【CS】【build】开始构建捕获请求"
                                         + (hasPending ? " (延迟重试触发播放)" : " (触发播放)"));
-                                if (VideoManager.getConfig().getBoolean(ConfigManager.KEY_ENABLE_PHOTO_FAKE, false)
+                                if (VideoManager.getConfig().getBoolean(ConfigManager.KEY_ENABLE_PHOTO_FAKE, true)
                                         && HookMain.camera2Hook.pendingPhotoSurface != null
                                         && HookMain.camera2Hook.isJpegReaderSurface(
                                                 HookMain.camera2Hook.pendingPhotoSurface)) {

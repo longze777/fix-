@@ -275,6 +275,11 @@ public class HookMain {
                 public void onActivityResumed(Activity activity) {
                     if (activity != null) {
                         String activityName = activity.getClass().getName();
+                        // Camera2 only: the activity name feeds the LINE/WhatsApp
+                        // VoIP/scanner surface decisions. Camera1 no longer has a
+                        // per-activity path - the virtual camera stays in place on
+                        // face-verify screens too (ScreenColorDetector injects the
+                        // liveness color tint into the rendered feed instead).
                         camera2Hook.setCurrentActivityClassName(activityName);
                         LogUtil.log("【CS】当前 Activity: " + activityName);
                     }
